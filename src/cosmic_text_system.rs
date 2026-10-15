@@ -53,6 +53,7 @@ struct CosmicTextSystemState {
     system_font_fallback: String,
 }
 
+#[derive(Clone)]
 struct LoadedFont {
     font: Arc<CosmicTextFont>,
     features: CosmicFontFeatures,
@@ -243,6 +244,90 @@ impl PlatformTextSystem for CosmicTextSystem {
 
     fn layout_line(&self, text: &str, font_size: Pixels, runs: &[FontRun]) -> LineLayout {
         self.0.write().layout_line(text, font_size, runs)
+    }
+
+    fn layout_line_in_background(
+        &self,
+        text: &str,
+        font_size: Pixels,
+        runs: &[FontRun],
+    ) -> LineLayout {
+        // Font identities are append-only. Copy immutable inputs under the
+        // lock; database indexing and shaping use private scratch afterwards.
+        let (database, locale, fonts, families, fallback) = {
+            let state = self.0.read();
+            (
+                state.font_system.db().clone(),
+                state.font_system.locale().to_owned(),
+                state.loaded_fonts.clone(),
+                state.font_ids_by_family_cache.clone(),
+                state.system_font_fallback.clone(),
+            )
+        };
+        let original_fonts = fonts.len();
+        let mut snapshot = CosmicTextSystemState {
+            font_system: FontSystem::new_with_locale_and_db(locale, database),
+            scratch: ShapeBuffer::default(),
+            swash_scale_context: ScaleContext::new(),
+            pending_glyph_images: HashMap::default(),
+            loaded_fonts: fonts,
+            font_ids_by_family_cache: families,
+            system_font_fallback: fallback,
+        };
+        let mut layout = snapshot.layout_line(text, font_size, runs);
+        // Shaping can discover fallback faces. Register only those faces and
+        // remap outside the lock; the number of glyph runs is not bounded by
+        // the number of fonts, and must never extend the critical section.
+        let remap = if snapshot.loaded_fonts.len() > original_fonts {
+            let mut state = self.0.write();
+            snapshot
+                .loaded_fonts
+                .drain(original_fonts..)
+                .map(|font| {
+                    if let Some(ix) = state
+                        .loaded_fonts
+                        .iter()
+                        .position(|old| old.font.id() == font.font.id())
+                    {
+                        FontId(ix)
+                    } else {
+                        let id = FontId(state.loaded_fonts.len());
+                        state.loaded_fonts.push(font);
+                        id
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        for run in &mut layout.runs {
+            if run.font_id.0 >= original_fonts {
+                run.font_id = remap[run.font_id.0 - original_fonts];
+            }
+        }
+        layout
+    }
+
+    fn independent_rasterizer(&self) -> Option<Arc<dyn PlatformTextSystem>> {
+        let (database, locale, fonts, families, fallback) = {
+            let state = self.0.read();
+            (
+                state.font_system.db().clone(),
+                state.font_system.locale().to_owned(),
+                state.loaded_fonts.clone(),
+                state.font_ids_by_family_cache.clone(),
+                state.system_font_fallback.clone(),
+            )
+        };
+        Some(Arc::new(Self(RwLock::new(CosmicTextSystemState {
+            font_system: FontSystem::new_with_locale_and_db(locale, database),
+            scratch: ShapeBuffer::default(),
+            swash_scale_context: ScaleContext::new(),
+            pending_glyph_images: HashMap::default(),
+            loaded_fonts: fonts,
+            font_ids_by_family_cache: families,
+            system_font_fallback: fallback,
+        }))))
     }
 
     fn recommended_rendering_mode(

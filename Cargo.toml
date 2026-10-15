@@ -142,3 +142,6 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+[patch.crates-io]
+gpui-pre = { path = "../gpui-pre" }
