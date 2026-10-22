@@ -142,3 +142,11 @@ priority = -1
 [lints.rust.unexpected_cfgs]
 level = "allow"
 priority = 0
+
+# The published package drops the shader tests' dev-dependency.
+[dev-dependencies.naga]
+version = "29.0.4"
+features = ["wgsl-in"]
+
+[patch.crates-io]
+gpui-pre = { path = "../gpui-pre" }

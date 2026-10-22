@@ -1,7 +1,8 @@
+// Modified to draw a synthetic oblique where a requested italic has no italic face.
 use anyhow::{Context as _, Ok, Result};
 use collections::HashMap;
 use cosmic_text::{
-    Attrs, AttrsList, Ellipsize, Family, Font as CosmicTextFont,
+    Attrs, AttrsList, CacheKeyFlags, Ellipsize, Family, Font as CosmicTextFont,
     FontFeatures as CosmicFontFeatures, FontSystem, ShapeBuffer, ShapeLine, Stretch, Style, Weight,
 };
 use gpui::{
@@ -17,7 +18,7 @@ use smallvec::SmallVec;
 use std::{borrow::Cow, ops::Range, sync::Arc};
 use swash::{
     scale::{Render, ScaleContext, Source, StrikeWith},
-    zeno::{Format, Vector},
+    zeno::{Angle, Format, Transform, Vector},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -50,6 +51,10 @@ struct CosmicTextSystemState {
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
+    /// Upright fonts drawn with a synthetic slant: each oblique font shares its
+    /// upright face under its own ID, so shaping and glyph caching stay per font.
+    oblique_ids: HashMap<FontId, FontId>,
+    upright_ids: HashMap<FontId, FontId>,
     system_font_fallback: String,
 }
 
@@ -117,6 +122,8 @@ impl CosmicTextSystem {
             pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
+            oblique_ids: HashMap::default(),
+            upright_ids: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
     }
@@ -134,6 +141,8 @@ impl CosmicTextSystem {
             pending_glyph_images: HashMap::default(),
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
+            oblique_ids: HashMap::default(),
+            upright_ids: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
         }))
     }
@@ -175,8 +184,12 @@ impl PlatformTextSystem for CosmicTextSystem {
         };
 
         let ix = find_best_match(font, candidates, &state)?;
+        let font_id = candidates[ix];
+        if font.style != gpui::FontStyle::Normal && !state.is_italic(font_id) {
+            return Ok(state.oblique_id(font_id));
+        }
 
-        Ok(candidates[ix])
+        Ok(font_id)
     }
 
     fn prewarm_fonts(&self, font_ids: &[FontId]) {
@@ -259,6 +272,34 @@ impl CosmicTextSystemState {
         &self.loaded_fonts[font_id.0]
     }
 
+    fn is_italic(&self, font_id: FontId) -> bool {
+        self.upright_ids.contains_key(&font_id)
+            || self
+                .font_system
+                .db()
+                .face(self.loaded_font(font_id).font.id())
+                .is_some_and(|face| face.style != Style::Normal)
+    }
+
+    /// The synthetic oblique of an upright font, registered on first use.
+    fn oblique_id(&mut self, upright_id: FontId) -> FontId {
+        if let Some(font_id) = self.oblique_ids.get(&upright_id) {
+            return *font_id;
+        }
+        let upright = self.loaded_font(upright_id);
+        let oblique = LoadedFont {
+            font: Arc::clone(&upright.font),
+            features: upright.features.clone(),
+            is_known_emoji_font: upright.is_known_emoji_font,
+            user_fallback_chain: Arc::clone(&upright.user_fallback_chain),
+        };
+        let font_id = FontId(self.loaded_fonts.len());
+        self.loaded_fonts.push(oblique);
+        self.oblique_ids.insert(upright_id, font_id);
+        self.upright_ids.insert(font_id, upright_id);
+        font_id
+    }
+
     fn font_match_properties(&self, font_id: FontId) -> Option<FontMatchProperties> {
         let loaded_font = self.loaded_font(font_id);
         let Some(face) = self.font_system.db().face(loaded_font.font.id()) else {
@@ -273,7 +314,13 @@ impl CosmicTextSystemState {
         Some(FontMatchProperties {
             primary_family_name: first_family.0.clone().into(),
             stretch: face.stretch,
-            style: face.style,
+            // cosmic-text marks glyphs of upright faces matched for italic
+            // attributes, including fallbacks, as fake italic.
+            style: if self.upright_ids.contains_key(&font_id) {
+                Style::Italic
+            } else {
+                face.style
+            },
             weight: face.weight,
             features: loaded_font.features.clone(),
             fallback_chain: Arc::clone(&loaded_font.user_fallback_chain),
@@ -487,6 +534,9 @@ impl CosmicTextSystemState {
         };
 
         let mut renderer = Render::new(sources);
+        if self.upright_ids.contains_key(&params.font_id) {
+            renderer.transform(Some(Transform::skew(Angle::from_degrees(14.), Angle::ZERO)));
+        }
         if params.subpixel_rendering {
             // There seems to be a bug in Swash where the B and R values are swapped.
             renderer
@@ -747,6 +797,13 @@ impl CosmicTextSystemState {
             if glyph.glyph_id == 3 && is_emoji {
                 continue;
             }
+
+            let upright_id = self.upright_ids.get(&font_id).copied().unwrap_or(font_id);
+            font_id = if glyph.cache_key_flags.contains(CacheKeyFlags::FAKE_ITALIC) && !is_emoji {
+                self.oblique_id(upright_id)
+            } else {
+                upright_id
+            };
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
@@ -1072,13 +1129,13 @@ mod tests {
         assert!(text_system.all_font_names().is_empty());
 
         text_system.add_fonts(vec![Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/lilex/Lilex-Regular.ttf"
+            "../assets/fonts/lilex/Lilex-Regular.ttf"
         ))])?;
         assert_eq!(text_system.all_font_names(), ["Lilex"]);
 
         text_system.add_fonts(vec![
             Cow::Borrowed(IBM_PLEX),
-            Cow::Borrowed(include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf")),
+            Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Bold.ttf")),
         ])?;
         assert_eq!(text_system.all_font_names(), ["IBM Plex Sans", "Lilex"]);
         Ok(())
@@ -1103,8 +1160,7 @@ mod tests {
         }
     }
 
-    const IBM_PLEX: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
+    const IBM_PLEX: &[u8] = include_bytes!("../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
 
     /// Every code point of `Bidi_Class=B`, each of which starts a new bidi
     /// paragraph and so can split one line into mixed-direction paragraphs.
@@ -1134,12 +1190,102 @@ mod tests {
                 ..regular.clone()
             };
             let font_id = text_system.font_id(&requested)?;
-            assert_eq!(font_id, regular_id);
+            let upright_id = text_system.0.read().upright_ids.get(&font_id).copied();
+            assert_eq!(upright_id.unwrap_or(font_id), regular_id);
             assert_eq!(
                 text_system.font_weight_and_style(font_id)?,
                 (gpui::FontWeight::NORMAL, gpui::FontStyle::Normal)
             );
         }
+        Ok(())
+    }
+
+    fn glyph_positions(layout: &LineLayout) -> Vec<gpui::Point<Pixels>> {
+        layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.position))
+            .collect()
+    }
+
+    #[test]
+    fn italic_without_an_italic_face_is_drawn_oblique() -> Result<()> {
+        let text_system = text_system()?;
+        let upright_font = gpui::font("IBM Plex Sans");
+        let upright = text_system.font_id(&upright_font)?;
+        let oblique = text_system.font_id(&Font {
+            style: gpui::FontStyle::Italic,
+            ..upright_font
+        })?;
+        assert_ne!(oblique, upright);
+
+        // The slant leaves shaping alone.
+        let text = "Italic";
+        let layout = |font_id| {
+            text_system.layout_line(
+                text,
+                gpui::px(14.),
+                &[FontRun {
+                    len: text.len(),
+                    font_id,
+                }],
+            )
+        };
+        let slanted = layout(oblique);
+        assert!(slanted.runs.iter().all(|run| run.font_id == oblique));
+        assert_eq!(glyph_positions(&slanted), glyph_positions(&layout(upright)));
+
+        // It leans the raster right, past the upright glyph's edge.
+        let glyph_id = text_system.glyph_for_char(upright, 'l').unwrap();
+        let bounds = |font_id| {
+            text_system.glyph_raster_bounds(&RenderGlyphParams {
+                font_id,
+                glyph_id,
+                font_size: gpui::px(14.),
+                subpixel_variant: Default::default(),
+                scale_factor: 2.,
+                is_emoji: false,
+                subpixel_rendering: false,
+                dilation: 0,
+            })
+        };
+        let (upright, oblique) = (bounds(upright)?, bounds(oblique)?);
+        assert_eq!(oblique.size.height, upright.size.height);
+        assert!(oblique.right() > upright.right());
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_inside_an_italic_run_is_drawn_oblique() -> Result<()> {
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        text_system.add_fonts(vec![
+            Cow::Borrowed(include_bytes!(
+                "../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf"
+            )),
+            Cow::Borrowed(include_bytes!("../assets/fonts/lilex/Lilex-Regular.ttf")),
+        ])?;
+        let italic = text_system.font_id(&Font {
+            style: gpui::FontStyle::Italic,
+            ..gpui::font("IBM Plex Sans")
+        })?;
+        let upright_fallback = text_system.font_id(&gpui::font("Lilex"))?;
+        // Plex has no box drawing, so the bar falls back to upright Lilex.
+        assert!(text_system.glyph_for_char(italic, '│').is_none());
+
+        let text = "a│";
+        let layout = text_system.layout_line(
+            text,
+            gpui::px(14.),
+            &[FontRun {
+                len: text.len(),
+                font_id: italic,
+            }],
+        );
+        let state = text_system.0.read();
+        assert!(!state.upright_ids.contains_key(&italic));
+        assert_eq!(layout.runs[0].font_id, italic);
+        let fallback = layout.runs.last().unwrap().font_id;
+        assert_eq!(state.upright_ids.get(&fallback), Some(&upright_fallback));
         Ok(())
     }
 
