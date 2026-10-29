@@ -79,8 +79,11 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 
 struct GlobalParams {
     viewport_size: vec2<f32>,
+    viewport_origin: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
 struct GammaParams {
@@ -168,7 +171,7 @@ struct TransformationMatrix {
 }
 
 fn to_device_position_impl(position: vec2<f32>) -> vec4<f32> {
-    let device_position = position / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
+    let device_position = (position - globals.viewport_origin) / globals.viewport_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0);
     return vec4<f32>(device_position, 0.0, 1.0);
 }
 
@@ -570,7 +573,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let quad = load_quad(input.quad_id);
 
-    let background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
+    let background_color = gradient_color(quad.background, (input.position.xy + globals.viewport_origin), quad.bounds,
         input.background_solid, input.background_color0, input.background_color1);
 
     let unrounded = quad.corner_radii.top_left == 0.0 &&
@@ -589,7 +592,7 @@ fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
 
     let size = quad.bounds.size;
     let half_size = size / 2.0;
-    let point = input.position.xy - quad.bounds.origin;
+    let point = (input.position.xy + globals.viewport_origin) - quad.bounds.origin;
     let center_to_point = point - half_size;
 
     // Signed distance field threshold for inclusion of pixels. 0.5 is the
@@ -1006,13 +1009,13 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
     let shadow = load_shadow(input.shadow_id);
     let half_size = shadow.bounds.size / 2.0;
     let center = shadow.bounds.origin + half_size;
-    let center_to_point = input.position.xy - center;
+    let center_to_point = (input.position.xy + globals.viewport_origin) - center;
 
     let corner_radius = pick_corner_radius(center_to_point, shadow.corner_radii);
 
     var alpha: f32;
     if (shadow.blur_radius == 0.0) {
-        let distance = quad_sdf(input.position.xy, shadow.bounds, shadow.corner_radii);
+        let distance = quad_sdf((input.position.xy + globals.viewport_origin), shadow.bounds, shadow.corner_radii);
         alpha = saturate(0.5 - distance);
     } else {
         // The signal is only non-zero in a limited range, so don't waste samples
@@ -1037,7 +1040,7 @@ fn fs_shadow(input: ShadowVarying) -> @location(0) vec4<f32> {
         // The inset shadow is the complement of the (blurred) hole rect, clipped to the element.
         // `saturate(0.5 - d)` gives a 1-pixel antialiased edge: d <= -0.5 -> 1, d >= 0.5 -> 0.
         alpha = 1.0 - alpha;
-        let element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+        let element_distance = quad_sdf((input.position.xy + globals.viewport_origin), shadow.element_bounds,
                                         shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
     }
@@ -1104,7 +1107,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
         background.solid,
         background.colors,
     );
-    let color = gradient_color(background, input.position.xy, bounds,
+    let color = gradient_color(background, (input.position.xy + globals.viewport_origin), bounds,
         prepared_gradient.solid, prepared_gradient.color0, prepared_gradient.color1);
     return vec4<f32>(color.rgb * color.a * alpha, color.a * alpha);
 }
@@ -1129,7 +1132,7 @@ fn vs_path(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
     let device_position = to_device_position(unit_vertex, sprite.bounds);
     // For screen-space intermediate texture, convert screen position to texture coordinates
     let screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    let texture_coords = screen_position / globals.viewport_size;
+    let texture_coords = (screen_position - globals.viewport_origin) / globals.viewport_size;
 
     var out = PathVarying();
     out.position = device_position;
@@ -1196,7 +1199,7 @@ fn fs_underline(input: UnderlineVarying) -> @location(0) vec4<f32> {
 
     let half_thickness = underline.thickness * 0.5;
 
-    let st = (input.position.xy - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
+    let st = ((input.position.xy + globals.viewport_origin) - underline.bounds.origin) / underline.bounds.size.y - vec2<f32>(0.0, 0.5);
     let frequency = M_PI_F * WAVE_FREQUENCY * underline.thickness / underline.bounds.size.y;
     let amplitude = (underline.thickness * WAVE_HEIGHT_RATIO) / underline.bounds.size.y;
 
@@ -1300,7 +1303,7 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     }
 
     let sprite = load_poly_sprite(input.sprite_id);
-    let distance = quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
+    let distance = quad_sdf((input.position.xy + globals.viewport_origin), sprite.bounds, sprite.corner_radii);
 
     var color = sample;
     if (sprite.grayscale != 0u) {
@@ -1359,4 +1362,45 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
         1.0);
 
     return ycbcr_to_RGB * y_cb_cr;
+}
+
+
+// Isolated surfaces use premultiplied pixels and apply their outer coverage once.
+struct CompositeParams {
+    bounds: Bounds,
+    clip_bounds: Bounds,
+    radii: Corners,
+}
+@group(1) @binding(0) var<uniform> composite: CompositeParams;
+
+struct CompositeVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+}
+
+@vertex
+fn vs_composite(@builtin(vertex_index) vertex_id: u32) -> CompositeVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out: CompositeVarying;
+    out.position = to_device_position(unit_vertex, composite.bounds);
+    out.uv = unit_vertex;
+    return out;
+}
+
+@fragment
+fn fs_composite(input: CompositeVarying) -> @location(0) vec4<f32> {
+    let color = textureSample(t_sprite, s_sprite, input.uv);
+    let distance = quad_sdf(input.position.xy + globals.viewport_origin, composite.clip_bounds, composite.radii);
+    return color * saturate(0.5 - distance);
+}
+
+// An isolated transparent surface has no known opaque backdrop for LCD blending.
+@fragment
+fn fs_subpixel_grayscale(input: MonoSpriteVarying) -> @location(0) vec4<f32> {
+    let sample = textureSample(t_sprite, s_sprite, input.tile_position).rgb;
+    let gray = dot(sample, vec3<f32>(1.0 / 3.0));
+    let alpha = apply_contrast_and_gamma_correction(gray, input.color.rgb,
+        gamma_params.grayscale_enhanced_contrast, gamma_params.gamma_ratios);
+    if (any(input.clip_distances < vec4<f32>(0.0))) { return vec4<f32>(0.0); }
+    return blend_color(input.color, alpha);
 }
