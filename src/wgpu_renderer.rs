@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, get_gamma_correction_ratios, size,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -148,6 +148,13 @@ struct InstanceBinding {
     /// shared instance texture absolutely, so draws must offset their
     /// instance (or vertex) ranges by this value.
     first_instance: u32,
+}
+
+struct PathBindings {
+    vertices: InstanceBinding,
+    vertex_count: u32,
+    sprites: InstanceBinding,
+    sprite_count: u32,
 }
 
 struct InstanceBindings {
@@ -1398,7 +1405,7 @@ impl WgpuRenderer {
         };
 
         // Now that we know the surface is healthy, ensure intermediate textures exist
-        if scene.paths.is_empty() {
+        if !scene.has_paths() {
             let resources = self.resources_mut();
             resources.path_intermediate_texture = None;
             resources.path_intermediate_view = None;
@@ -1479,6 +1486,13 @@ impl WgpuRenderer {
             paths: resources.path_intermediate_view.clone(),
             path_msaa: resources.path_msaa_view.clone(),
             isolated: false,
+            bounds: Bounds::new(
+                Point::default(),
+                size(
+                    ScaledPixels(self.surface_config.width as f32),
+                    ScaledPixels(self.surface_config.height as f32),
+                ),
+            ),
         };
         let mut encoder =
             resources
@@ -1488,11 +1502,14 @@ impl WgpuRenderer {
                 });
         let mut instance_offset = 0;
         let mut surface_ix = 0;
+        let bindings = self.prepare_bindings(scene, &mut instance_offset)?;
         self.record_scene(
             scene,
+            &bindings,
             &target,
+            &[target.bounds],
+            true,
             &mut encoder,
-            &mut instance_offset,
             &mut surface_ix,
         )?;
         self.resources_mut().clip_surfaces.truncate(surface_ix);
@@ -1502,120 +1519,153 @@ impl WgpuRenderer {
         Ok(())
     }
 
+    fn prepare_bindings(&mut self, scene: &Scene, offset: &mut u64) -> Result<clip::Bindings> {
+        let instances = self.write_instances(scene, offset)?;
+        let batches: Vec<_> = scene.batches().collect();
+        let mut paths = Vec::new();
+        for batch in &batches {
+            if let PrimitiveBatch::Paths(range) = batch {
+                paths.push((
+                    range.start,
+                    self.write_paths(&scene.paths[range.clone()], offset)?,
+                ));
+            }
+        }
+        let children = scene
+            .composites
+            .iter()
+            .map(|c| self.prepare_bindings(c.scene(), offset))
+            .collect::<Result<_>>()?;
+        Ok(clip::Bindings {
+            instances,
+            batches,
+            paths,
+            children,
+        })
+    }
+
     fn record_scene(
         &mut self,
         scene: &Scene,
+        bindings: &clip::Bindings,
         target: &clip::Target,
+        scissors: &[Bounds<ScaledPixels>],
+        clear: bool,
         encoder: &mut wgpu::CommandEncoder,
-        instance_offset: &mut u64,
         surface_ix: &mut usize,
     ) -> Result<()> {
-        let mut composites = Vec::with_capacity(scene.composites.len());
-        for composite in &scene.composites {
-            let prepared = self.prepare_composite(composite, *surface_ix)?;
-            if let Some(prepared) = &prepared {
-                *surface_ix += 1;
-                self.record_scene(
-                    composite.scene(),
-                    &prepared.target,
-                    encoder,
-                    instance_offset,
-                    surface_ix,
-                )?;
+        let instance_bindings = &bindings.instances;
+        let mut pass = target.pass(encoder, clear);
+        for batch in &bindings.batches {
+            if let PrimitiveBatch::Composites(range) = batch {
+                drop(pass);
+                for ix in range.clone() {
+                    let composite = &scene.composites[ix];
+                    let tiles = composite.tiles(target.bounds);
+                    let intersect = |regions: &[Bounds<ScaledPixels>]| -> Vec<_> {
+                        regions
+                            .iter()
+                            .flat_map(|r| scissors.iter().map(move |s| r.intersect(s)))
+                            .filter(|r| !r.is_empty())
+                            .collect()
+                    };
+                    let direct = intersect(tiles.direct());
+                    if !direct.is_empty() {
+                        self.record_scene(
+                            composite.scene(),
+                            &bindings.children[ix],
+                            target,
+                            &direct,
+                            false,
+                            encoder,
+                            surface_ix,
+                        )?;
+                    }
+                    for bounds in intersect(tiles.isolated()) {
+                        let prepared = self.prepare_composite(composite, bounds, *surface_ix);
+                        *surface_ix += 1;
+                        self.record_scene(
+                            composite.scene(),
+                            &bindings.children[ix],
+                            &prepared.target,
+                            &[bounds],
+                            true,
+                            encoder,
+                            surface_ix,
+                        )?;
+                        let mut pass = target.pass(encoder, false);
+                        target.scissor(bounds, &mut pass);
+                        pass.set_pipeline(&self.target_pipelines(target).composite);
+                        pass.set_bind_group(0, &target.globals, &[]);
+                        pass.set_bind_group(1, &prepared.params, &[]);
+                        pass.set_bind_group(2, &prepared.texture, &[]);
+                        pass.draw(0..4, 0..1);
+                    }
+                }
+                pass = target.pass(encoder, false);
+                continue;
             }
-            composites.push(prepared);
-        }
-        let instance_bindings = self.write_instances(scene, instance_offset)?;
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-
-            for batch in scene.batches() {
+            if let PrimitiveBatch::Paths(range) = batch {
+                let paths = &bindings
+                    .paths
+                    .iter()
+                    .find(|(start, _)| *start == range.start)
+                    .expect("path batch uploaded")
+                    .1;
+                drop(pass);
+                self.draw_paths_to_intermediate(encoder, paths, target);
+                pass = target.pass(encoder, false);
+            }
+            for &bounds in scissors {
+                let visible = scene.visible_range(batch, bounds);
+                if visible.is_empty() {
+                    continue;
+                }
+                target.scissor(bounds, &mut pass);
                 match batch {
-                    PrimitiveBatch::Quads(range) => self.draw_instances(
+                    PrimitiveBatch::Quads(_) => self.draw_instances(
                         &instance_bindings.quads,
                         &self.target_pipelines(target).quads,
-                        instance_range(range),
+                        instance_range(visible.clone()),
                         target,
                         &mut pass,
                     ),
-                    PrimitiveBatch::Shadows(range) => self.draw_instances(
+                    PrimitiveBatch::Shadows(_) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.target_pipelines(target).shadows,
-                        instance_range(range),
+                        instance_range(visible.clone()),
                         target,
                         &mut pass,
                     ),
                     PrimitiveBatch::Paths(range) => {
-                        let paths = &scene.paths[range];
-                        if paths.is_empty() {
-                            continue;
-                        }
-
-                        drop(pass);
-                        let rasterized = self.draw_paths_to_intermediate(
-                            encoder,
-                            paths,
-                            instance_offset,
-                            target,
-                        )?;
-
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("main_pass_continued"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: &target.view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Load,
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-
-                        if rasterized {
-                            self.draw_paths_from_intermediate(
-                                paths,
-                                instance_offset,
-                                target,
-                                &mut pass,
-                            )?;
-                        }
+                        let paths = &bindings
+                            .paths
+                            .iter()
+                            .find(|(start, _)| *start == range.start)
+                            .expect("path batch uploaded")
+                            .1;
+                        self.draw_paths_from_intermediate(paths, target, &mut pass);
                     }
-                    PrimitiveBatch::Underlines(range) => self.draw_instances(
+                    PrimitiveBatch::Underlines(_) => self.draw_instances(
                         &instance_bindings.underlines,
                         &self.target_pipelines(target).underlines,
-                        instance_range(range),
+                        instance_range(visible.clone()),
                         target,
                         &mut pass,
                     ),
-                    PrimitiveBatch::MonochromeSprites { texture_id, range } => self.draw_sprites(
+                    PrimitiveBatch::MonochromeSprites { texture_id, .. } => self.draw_sprites(
                         &instance_bindings.monochrome_sprites,
-                        texture_id,
+                        *texture_id,
                         &self.target_pipelines(target).mono_sprites,
-                        instance_range(range),
+                        instance_range(visible.clone()),
                         target,
                         &mut pass,
                     ),
-                    PrimitiveBatch::SubpixelSprites { texture_id, range } => {
+                    PrimitiveBatch::SubpixelSprites { texture_id, .. } => {
                         let pipelines = self.target_pipelines(target);
                         self.draw_sprites(
                             &instance_bindings.subpixel_sprites,
-                            texture_id,
+                            *texture_id,
                             if target.isolated {
                                 &pipelines.subpixel_grayscale
                             } else {
@@ -1624,37 +1674,25 @@ impl WgpuRenderer {
                                     .as_ref()
                                     .unwrap_or(&pipelines.mono_sprites)
                             },
-                            instance_range(range),
+                            instance_range(visible.clone()),
                             target,
                             &mut pass,
                         );
                     }
-                    PrimitiveBatch::PolychromeSprites { texture_id, range } => self.draw_sprites(
+                    PrimitiveBatch::PolychromeSprites { texture_id, .. } => self.draw_sprites(
                         &instance_bindings.polychrome_sprites,
-                        texture_id,
+                        *texture_id,
                         &self.target_pipelines(target).poly_sprites,
-                        instance_range(range),
+                        instance_range(visible.clone()),
                         target,
                         &mut pass,
                     ),
-                    PrimitiveBatch::Composites(range) => {
-                        for ix in range {
-                            if let Some(composite) = &composites[ix] {
-                                pass.set_pipeline(&self.target_pipelines(target).composite);
-                                pass.set_bind_group(0, &target.globals, &[]);
-                                pass.set_bind_group(1, &composite.params, &[]);
-                                pass.set_bind_group(2, &composite.texture, &[]);
-                                pass.draw(0..4, 0..1);
-                            }
-                        }
-                    }
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Composites(_) => unreachable!(),
+                    // Surfaces are macOS-only for video playback.
+                    PrimitiveBatch::Surfaces(_) => {}
                 }
             }
         }
-
         Ok(())
     }
 
@@ -1776,57 +1814,11 @@ impl WgpuRenderer {
         }
     }
 
-    fn draw_paths_from_intermediate(
+    fn write_paths(
         &mut self,
         paths: &[Path<ScaledPixels>],
-        instance_offset: &mut u64,
-        target: &clip::Target,
-        pass: &mut wgpu::RenderPass<'_>,
-    ) -> Result<()> {
-        let first_path = &paths[0];
-        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first_path.order)
-        {
-            paths
-                .iter()
-                .map(|p| PathSprite {
-                    bounds: p.clipped_bounds(),
-                })
-                .collect()
-        } else {
-            let mut bounds = first_path.clipped_bounds();
-            for path in paths.iter().skip(1) {
-                bounds = bounds.union(&path.clipped_bounds());
-            }
-            vec![PathSprite { bounds }]
-        };
-
-        let Some(path_intermediate_view) = target.paths.clone() else {
-            return Ok(());
-        };
-        let instances =
-            self.write_instance_binding("path_sprites_bind_group", instance_offset, &sprites)?;
-        let texture = self.create_texture_bind_group(
-            "path_intermediate_texture_bind_group",
-            &path_intermediate_view,
-        );
-        pass.set_pipeline(&self.target_pipelines(target).paths);
-        pass.set_bind_group(0, &target.globals, &[]);
-        pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &texture, &[]);
-        pass.draw(
-            0..4,
-            instances.first_instance..instances.first_instance + sprites.len() as u32,
-        );
-        Ok(())
-    }
-
-    fn draw_paths_to_intermediate(
-        &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        paths: &[Path<ScaledPixels>],
-        instance_offset: &mut u64,
-        target: &clip::Target,
-    ) -> Result<bool> {
+        offset: &mut u64,
+    ) -> Result<PathBindings> {
         let mut vertices = Vec::new();
         for path in paths {
             let bounds = path.clipped_bounds();
@@ -1837,57 +1829,88 @@ impl WgpuRenderer {
                 bounds,
             }));
         }
-
-        if vertices.is_empty() {
-            return Ok(false);
-        }
-
-        let vertex_binding = self.write_instance_binding(
-            "path_rasterization_bind_group",
-            instance_offset,
-            &vertices,
-        )?;
-
-        let Some(path_intermediate_view) = target.paths.as_ref() else {
-            return Ok(false);
-        };
-
-        let (target_view, resolve_target) = if let Some(ref msaa_view) = target.path_msaa {
-            (msaa_view, Some(path_intermediate_view))
+        let first = &paths[0];
+        let sprites: Vec<PathSprite> = if paths.last().map(|p| &p.order) == Some(&first.order) {
+            paths
+                .iter()
+                .map(|p| PathSprite {
+                    bounds: p.clipped_bounds(),
+                })
+                .collect()
         } else {
-            (path_intermediate_view, None)
+            let bounds = paths
+                .iter()
+                .skip(1)
+                .fold(first.clipped_bounds(), |b, p| b.union(&p.clipped_bounds()));
+            vec![PathSprite { bounds }]
         };
+        Ok(PathBindings {
+            vertices: self.write_instance_binding("path_vertices", offset, &vertices)?,
+            vertex_count: vertices.len() as u32,
+            sprites: self.write_instance_binding("path_sprites", offset, &sprites)?,
+            sprite_count: sprites.len() as u32,
+        })
+    }
 
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("path_rasterization_pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target_view,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            });
-
-            pass.set_pipeline(&self.target_pipelines(target).path_rasterization);
-            pass.set_bind_group(0, &target.path_globals, &[]);
-            pass.set_bind_group(1, &vertex_binding.bind_group, &[]);
-            // The path rasterization shader loads records by vertex index
-            // rather than instance index, so the allocation's base shifts the
-            // vertex range here.
-            pass.draw(
-                vertex_binding.first_instance
-                    ..vertex_binding.first_instance + vertices.len() as u32,
-                0..1,
-            );
+    fn draw_paths_from_intermediate(
+        &self,
+        paths: &PathBindings,
+        target: &clip::Target,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        if paths.vertex_count == 0 {
+            return;
         }
+        let Some(view) = &target.paths else {
+            return;
+        };
+        let texture = self.create_texture_bind_group("path_intermediate_texture", view);
+        pass.set_pipeline(&self.target_pipelines(target).paths);
+        pass.set_bind_group(0, &target.globals, &[]);
+        pass.set_bind_group(1, &paths.sprites.bind_group, &[]);
+        pass.set_bind_group(2, &texture, &[]);
+        pass.draw(
+            0..4,
+            paths.sprites.first_instance..paths.sprites.first_instance + paths.sprite_count,
+        );
+    }
 
-        Ok(true)
+    fn draw_paths_to_intermediate(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        paths: &PathBindings,
+        target: &clip::Target,
+    ) {
+        if paths.vertex_count == 0 {
+            return;
+        }
+        let Some(view) = &target.paths else {
+            return;
+        };
+        let (target_view, resolve_target) = match &target.path_msaa {
+            Some(msaa) => (msaa, Some(view)),
+            None => (view, None),
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("path_rasterization_pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.target_pipelines(target).path_rasterization);
+        pass.set_bind_group(0, &target.path_globals, &[]);
+        pass.set_bind_group(1, &paths.vertices.bind_group, &[]);
+        pass.draw(
+            paths.vertices.first_instance..paths.vertices.first_instance + paths.vertex_count,
+            0..1,
+        );
     }
 
     fn write_instance_binding<T>(

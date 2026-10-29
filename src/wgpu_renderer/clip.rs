@@ -1,7 +1,6 @@
-use super::{GammaParams, GlobalParams, PodBounds, WgpuPipelines, WgpuRenderer};
-use anyhow::Result;
+use super::{GammaParams, GlobalParams, InstanceBindings, PodBounds, WgpuPipelines, WgpuRenderer};
 use bytemuck::{Pod, Zeroable};
-use gpui::{Bounds, Composite, ScaledPixels, point, size};
+use gpui::{Bounds, Composite, ScaledPixels};
 use std::num::NonZeroU64;
 use wgpu::util::DeviceExt;
 
@@ -13,6 +12,49 @@ pub(super) struct Target {
     pub paths: Option<wgpu::TextureView>,
     pub path_msaa: Option<wgpu::TextureView>,
     pub isolated: bool,
+    pub bounds: Bounds<ScaledPixels>,
+}
+
+pub(super) struct Bindings {
+    pub instances: InstanceBindings,
+    pub batches: Vec<gpui::PrimitiveBatch>,
+    pub paths: Vec<(usize, super::PathBindings)>,
+    pub children: Vec<Bindings>,
+}
+
+impl Target {
+    pub fn pass<'a>(
+        &self,
+        encoder: &'a mut wgpu::CommandEncoder,
+        clear: bool,
+    ) -> wgpu::RenderPass<'a> {
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &self.view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: if clear {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        })
+    }
+
+    pub fn scissor(&self, bounds: Bounds<ScaledPixels>, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_scissor_rect(
+            (bounds.left() - self.bounds.left()).0 as u32,
+            (bounds.top() - self.bounds.top()).0 as u32,
+            bounds.size.width.0 as u32,
+            bounds.size.height.0 as u32,
+        );
+    }
 }
 
 pub(super) struct Surface {
@@ -51,33 +93,13 @@ impl WgpuRenderer {
     pub(super) fn prepare_composite(
         &mut self,
         composite: &Composite,
+        bounds: Bounds<ScaledPixels>,
         ix: usize,
-    ) -> Result<Option<Prepared>> {
-        let visible = composite
-            .bounds()
-            .intersect(&composite.content_mask().bounds);
-        // Clip to the actual drawable, including when the device clamps a huge window.
-        let viewport = Bounds::new(
-            point(ScaledPixels(0.), ScaledPixels(0.)),
-            size(
-                ScaledPixels(self.surface_config.width as f32),
-                ScaledPixels(self.surface_config.height as f32),
-            ),
-        );
-        let visible = visible.intersect(&viewport);
-        if visible.is_empty() {
-            return Ok(None);
-        }
-        let origin = point(
-            ScaledPixels(visible.left().0.floor()),
-            ScaledPixels(visible.top().0.floor()),
-        );
-        let width = (visible.right().0.ceil() - origin.x.0) as u32;
-        let height = (visible.bottom().0.ceil() - origin.y.0) as u32;
-        let bounds = Bounds::new(
-            origin,
-            size(ScaledPixels(width as f32), ScaledPixels(height as f32)),
-        );
+    ) -> Prepared {
+        debug_assert!(!bounds.is_empty());
+        let origin = bounds.origin;
+        let width = bounds.size.width.0 as u32;
+        let height = bounds.size.height.0 as u32;
         let format = self.surface_config.format;
         let samples = self.rendering_params.path_sample_count;
         let path_offset = self.path_globals_offset;
@@ -167,6 +189,7 @@ impl WgpuRenderer {
                     paths: None,
                     path_msaa: None,
                     isolated: true,
+                    bounds,
                 },
                 uniforms,
             });
@@ -174,14 +197,15 @@ impl WgpuRenderer {
         let surface = resources.clip_surfaces[ix]
             .as_mut()
             .expect("surface prepared");
-        if !composite.scene().paths.is_empty() && surface.target.paths.is_none() {
+        surface.target.bounds = bounds;
+        if composite.scene().has_paths() && surface.target.paths.is_none() {
             surface.target.paths =
                 Some(Self::create_path_intermediate(&resources.device, format, width, height).1);
             surface.target.path_msaa =
                 Self::create_msaa_if_needed(&resources.device, format, width, height, samples)
                     .map(|(_, view)| view);
         }
-        if composite.scene().paths.is_empty() {
+        if !composite.scene().has_paths() {
             surface.target.paths = None;
             surface.target.path_msaa = None;
         }
@@ -235,11 +259,11 @@ impl WgpuRenderer {
                 }],
             });
         let texture = self.create_texture_bind_group("rounded_clip_texture", &target.view);
-        Ok(Some(Prepared {
+        Prepared {
             target,
             params,
             texture,
-        }))
+        }
     }
 }
 

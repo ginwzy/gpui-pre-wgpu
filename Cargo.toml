@@ -150,3 +150,8 @@ features = ["wgsl-in"]
 
 [patch.crates-io]
 gpui-pre = { path = "../gpui-pre" }
+
+[dev-dependencies.gpui]
+version = "=0.3.5"
+package = "gpui-pre"
+features = ["test-support"]

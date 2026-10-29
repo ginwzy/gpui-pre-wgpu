@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+mod tiles;
+
 use super::Params;
 use crate::wgpu_renderer::{GammaParams, GlobalParams, WgpuRenderer};
 use gpui::{Bounds, ContentMask, Quad, ScaledPixels, point, rgb, size};
@@ -88,12 +91,12 @@ fn composited_edges_have_one_coverage_after_overlapping_backgrounds() {
             ],
         })
     };
-    for scale in [1., 1.25, 2.] {
+    for scale in [1.0_f32, 1.25, 2.] {
         let extent = (96. * scale) as u32;
-        let x = (10. * scale as f32).floor();
-        let y = (20. * scale as f32).floor();
-        let width = (74. * scale as f32).ceil() - x;
-        let height = (84. * scale as f32).ceil() - y;
+        let x = (10. * scale).floor();
+        let y = (20. * scale).floor();
+        let width = (74. * scale).ceil() - x;
+        let height = (84. * scale).ceil() - y;
         let original = Bounds::new(
             point(ScaledPixels(10. * scale), ScaledPixels(20. * scale)),
             size(ScaledPixels(64. * scale), ScaledPixels(64. * scale)),
